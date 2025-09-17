@@ -4,8 +4,8 @@ A comprehensive contract management system with AI-powered analysis, built with 
 
 ## 🚀 Live Demo
 
-- **Frontend**: [Deployed on vercel](https://contractsense-dashboard2.vercel.app/login)
-- **Backend**: [Deployed on Render](https://contractsense-dashboard2.onrender.com/login)
+- **Frontend**: [Deployed on vercel](https://contractsense-dashboard2.vercel.app/)
+- **Backend**: [Deployed on Render](https://contractsense-dashboard2.onrender.com)
 
 ### Demo Credentials
 - **Email**: `demo@contract.ai`
