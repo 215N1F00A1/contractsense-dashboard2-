@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Query
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from typing import List, Optional
+import uuid
 from datetime import datetime
 import os
 from dotenv import load_dotenv
@@ -30,8 +30,11 @@ from .llama_mock import mock_llama_parse
 # Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Initialize FastAPI app
 app = FastAPI(
     title="ContractAI API",
     description="AI-Powered Contract Management System",
@@ -41,7 +44,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend-domain.com"],
+    allow_origins=["http://localhost:3000", "https://contractsense-dashboard2.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,16 +77,14 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+# ---------------- AUTH ----------------
+
 @app.post("/auth/signup", response_model=TokenResponse)
 async def signup(user_data: UserCreate, db: Session = Depends(get_db)):
     """User registration"""
-    existing_user = (
-        db.query(User)
-        .filter(
-            (User.email == user_data.email) | (User.username == user_data.username)
-        )
-        .first()
-    )
+    existing_user = db.query(User).filter(
+        (User.email == user_data.email) | (User.username == user_data.username)
+    ).first()
 
     if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
@@ -117,6 +118,8 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
     return TokenResponse(access_token=access_token, token_type="bearer")
 
 
+# ---------------- UPLOAD ----------------
+
 @app.post("/upload")
 async def upload_contract(
     file: UploadFile = File(...),
@@ -124,6 +127,7 @@ async def upload_contract(
     db: Session = Depends(get_db),
 ):
     """Upload and process contract document"""
+
     allowed_types = [
         "application/pdf",
         "text/plain",
@@ -133,8 +137,11 @@ async def upload_contract(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     content = await file.read()
+
+    # Mock parsing with llama
     parsed_result = mock_llama_parse(file.filename, content)
 
+    # Save document
     document = Document(
         user_id=current_user.user_id,
         filename=file.filename,
@@ -148,12 +155,18 @@ async def upload_contract(
     db.commit()
     db.refresh(document)
 
+    # Generate embeddings for each chunk
     for chunk_data in parsed_result["chunks"]:
+        embedding_response = client.embeddings.create(
+            input=chunk_data["text"], model="text-embedding-3-small"
+        )
+        embedding = embedding_response.data[0].embedding
+
         chunk = Chunk(
             doc_id=document.doc_id,
             user_id=current_user.user_id,
             text_chunk=chunk_data["text"],
-            embedding=chunk_data["embedding"],
+            embedding=embedding,
             metadata=chunk_data["metadata"],
         )
         db.add(chunk)
@@ -165,6 +178,8 @@ async def upload_contract(
         "document_id": str(document.doc_id),
     }
 
+
+# ---------------- CONTRACTS ----------------
 
 @app.get("/contracts", response_model=List[ContractResponse])
 async def get_contracts(
@@ -200,9 +215,7 @@ async def get_contract_detail(
     """Get detailed contract information"""
     contract = (
         db.query(Document)
-        .filter(
-            Document.doc_id == contract_id, Document.user_id == current_user.user_id
-        )
+        .filter(Document.doc_id == contract_id, Document.user_id == current_user.user_id)
         .first()
     )
 
@@ -217,11 +230,11 @@ async def get_contract_detail(
 
     return {
         "contract": ContractResponse.from_orm(contract),
-        "chunks": [
-            {"text": chunk.text_chunk, "metadata": chunk.metadata} for chunk in chunks
-        ],
+        "chunks": [{"text": c.text_chunk, "metadata": c.metadata} for c in chunks],
     }
 
+
+# ---------------- ASK / RAG ----------------
 
 @app.post("/ask", response_model=QueryResponse)
 async def query_contracts(
@@ -229,62 +242,62 @@ async def query_contracts(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Natural language query interface with OpenAI embeddings + pgvector similarity"""
+    """Natural language query interface with OpenAI + pgvector"""
 
-    if not OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-        )
+    # Generate query embedding
+    query_embedding = client.embeddings.create(
+        input=query_data.query, model="text-embedding-3-small"
+    ).data[0].embedding
 
-    # Generate embedding for the query text
-    embedding_response = client.embeddings.create(
-        input=query_data.query,
-        model="text-embedding-3-small",  # You can use text-embedding-3-large for better accuracy
-    )
-    query_embedding = embedding_response.data[0].embedding
-
-    # Perform vector similarity search using pgvector
-    sql = text(
+    # Perform similarity search using PostgreSQL + pgvector
+    results = db.execute(
         """
         SELECT chunk_id, text_chunk, metadata,
-               1 - (embedding <-> :query_embedding) AS relevance
+               1 - (embedding <=> :embedding) AS similarity
         FROM chunks
         WHERE user_id = :user_id
-        ORDER BY embedding <-> :query_embedding
-        LIMIT 5;
-        """
-    )
-
-    results = db.execute(
-        sql,
-        {"user_id": str(current_user.user_id), "query_embedding": query_embedding},
+        ORDER BY embedding <=> :embedding
+        LIMIT 5
+        """,
+        {"embedding": query_embedding, "user_id": str(current_user.user_id)},
     ).fetchall()
 
-    # Generate AI-style answer (stubbed)
-    ai_answer = f"Based on your contracts, here are relevant insights for '{query_data.query}'."
-
-    relevant_chunks = []
-    for row in results:
-        r = row._mapping
-        relevant_chunks.append(
+    # Call OpenAI Chat for contextual answer
+    context = "\n\n".join([row.text_chunk for row in results])
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a legal contract assistant."},
             {
-                "text": r["text_chunk"],
-                "metadata": r["metadata"],
-                "relevance_score": round(float(r["relevance"]) * 100, 2),
-            }
-        )
-
-    return QueryResponse(
-        answer=ai_answer, chunks=relevant_chunks, query=query_data.query
+                "role": "user",
+                "content": f"Question: {query_data.query}\n\nRelevant context:\n{context}",
+            },
+        ],
     )
 
+    answer = completion.choices[0].message.content
+
+    return QueryResponse(
+        answer=answer,
+        query=query_data.query,
+        chunks=[
+            {
+                "text": row.text_chunk,
+                "metadata": row.metadata,
+                "relevance_score": float(row.similarity) * 100,
+            }
+            for row in results
+        ],
+    )
+
+
+# ---------------- ANALYTICS ----------------
 
 @app.get("/analytics/summary")
 async def get_analytics_summary(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Get portfolio analytics summary"""
+    """Portfolio summary analytics"""
     total_contracts = (
         db.query(Document).filter(Document.user_id == current_user.user_id).count()
     )
@@ -297,10 +310,12 @@ async def get_analytics_summary(
     return {
         "total_contracts": total_contracts,
         "active_contracts": active_contracts,
-        "high_risk_contracts": 2,  # Mock data
-        "expiring_soon": 3,  # Mock data
+        "high_risk_contracts": 2,  # Mock
+        "expiring_soon": 3,  # Mock
     }
 
+
+# ---------------- DELETE ----------------
 
 @app.delete("/contracts/{contract_id}")
 async def delete_contract(
@@ -308,12 +323,10 @@ async def delete_contract(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete a contract and its associated chunks"""
+    """Delete contract + its chunks"""
     contract = (
         db.query(Document)
-        .filter(
-            Document.doc_id == contract_id, Document.user_id == current_user.user_id
-        )
+        .filter(Document.doc_id == contract_id, Document.user_id == current_user.user_id)
         .first()
     )
 
@@ -327,9 +340,10 @@ async def delete_contract(
     return {"message": "Contract deleted successfully"}
 
 
+# ---------------- HEALTH ----------------
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
 
